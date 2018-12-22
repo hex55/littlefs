@@ -120,6 +120,8 @@ enum lfs_type {
     // internal chip sources
     LFS_FROM_MEM            = 0x000,
     LFS_FROM_DISK           = 0x200,
+
+    LFS_FROM_NOOP           = 0x060,
     LFS_FROM_MOVE           = 0x061,
     LFS_FROM_USERATTRS      = 0x062,
 };
