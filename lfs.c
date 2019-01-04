@@ -344,47 +344,50 @@ struct lfs_diskoff {
 };
 
 // operations on set of globals
-static inline void lfs_global_xor(struct lfs_globals *a,
-        const struct lfs_globals *b) {
-    uint32_t *a32 = (uint32_t *)a;
-    const uint32_t *b32 = (const uint32_t *)b;
-    for (unsigned i = 0; i < sizeof(struct lfs_globals)/4; i++) {
-        a32[i] ^= b32[i];
+enum {
+    LFS_G_HASMOVE    = 0x100,
+    LFS_G_HASORPHANS = 0x001,
+};
+
+static inline void lfs_global_xor(union lfs_globals *a,
+        const union lfs_globals *b) {
+    for (int i = 0; i < 3; i++) {
+        a->u32[i] ^= b->u32[i];
     }
 }
 
-static inline bool lfs_global_iszero(const struct lfs_globals *a) {
-    const uint32_t *a32 = (const uint32_t *)a;
-    for (unsigned i = 0; i < sizeof(struct lfs_globals)/4; i++) {
-        if (a32[i] != 0) {
+static inline bool lfs_global_iszero(const union lfs_globals *a) {
+    for (int i = 0; i < 3; i++) {
+        if (a->u32[i] != 0) {
             return false;
         }
     }
     return true;
 }
 
-static inline void lfs_global_zero(struct lfs_globals *a) {
+static inline void lfs_global_zero(union lfs_globals *a) {
     lfs_global_xor(a, a);
 }
 
-static inline void lfs_global_fromle32(struct lfs_globals *a) {
-    lfs_pair_fromle32(a->pair);
-    a->id = lfs_fromle16(a->id);
+static inline void lfs_global_fromle32(union lfs_globals *a) {
+    for (int i = 0; i < 3; i++) {
+        a->u32[i] = lfs_fromle32(a->u32[i]);
+    }
 }
 
-static inline void lfs_global_tole32(struct lfs_globals *a) {
-    lfs_pair_tole32(a->pair);
-    a->id = lfs_tole16(a->id);
+static inline void lfs_global_tole32(union lfs_globals *a) {
+    lfs_global_fromle32(a);
 }
 
 static inline void lfs_global_move(lfs_t *lfs,
         bool hasmove, const lfs_block_t pair[2], uint16_t id) {
     lfs_global_fromle32(&lfs->locals);
     lfs_global_xor(&lfs->locals, &lfs->globals);
-    lfs->globals.hasmove = hasmove;
-    lfs->globals.pair[0] = pair[0];
-    lfs->globals.pair[1] = pair[1];
-    lfs->globals.id      = id;
+    lfs->globals.move.tag &= ~LFS_MKTAG(0x1fff, 0x1ff, LFS_G_HASMOVE);
+    lfs->globals.move.tag |= hasmove ? LFS_G_HASMOVE : 0;
+    lfs->globals.move.tag |= LFS_MKTAG(LFS_TYPE_DELETE+0xff, id, 0);
+    lfs->globals.move.pair[0] = pair[0];
+    lfs->globals.move.pair[1] = pair[1];
     lfs_global_xor(&lfs->locals, &lfs->globals);
     lfs_global_tole32(&lfs->locals);
 }
@@ -393,6 +396,22 @@ static inline void lfs_global_orphans(lfs_t *lfs, int8_t orphans) {
     lfs->locals.orphans ^= (lfs->globals.orphans == 0);
     lfs->globals.orphans += orphans;
     lfs->locals.orphans ^= (lfs->globals.orphans == 0);
+}
+
+static inline bool lfs_globals_hasmove(lfs_t *lfs) {
+    return lfs->globals.flags & LFS_G_HASMOVE;
+}
+
+static inline uint8_t lfs_globals_getorphans(lfs_t *lfs) {
+    return lfs->globals.orphans;
+}
+
+static inline uint16_t lfs_globals_id(lfs_t *lfs) {
+    return lfs_tag_id(lfs->globals.move.tag);
+}
+
+static inline lfs_block_t *lfs_globals_pair(lfs_t *lfs) {
+    return lfs->globals.move.pair;
 }
 
 // other endianness operations
@@ -513,9 +532,9 @@ static lfs_stag_t lfs_dir_get(lfs_t *lfs, const lfs_mdir_t *dir,
     lfs_tag_t ntag = dir->etag;
     lfs_stag_t gdiff = 0;
 
-    if (lfs->globals.hasmove &&
-            lfs_pair_cmp(dir->pair, lfs->globals.pair) == 0 &&
-            lfs_tag_id(gtag) <= lfs->globals.id) {
+    if (lfs_globals_hasmove(lfs) &&
+            lfs_pair_cmp(dir->pair, lfs_globals_pair(lfs)) == 0 &&
+            lfs_tag_id(gtag) <= lfs_globals_id(lfs)) {
         // synthetic moves
         gdiff -= LFS_MKTAG(0, 1, 0);
     }
@@ -878,12 +897,12 @@ static lfs_stag_t lfs_dir_fetchmatch(lfs_t *lfs,
         // consider what we have good enough
         if (dir->off > 0) {
             // synthetic move
-            if (lfs->globals.hasmove &&
-                    lfs_pair_cmp(dir->pair, lfs->globals.pair) == 0) {
-                if (lfs->globals.id == lfs_tag_id(besttag)) {
+            if (lfs_globals_hasmove(lfs) &&
+                    lfs_pair_cmp(dir->pair, lfs_globals_pair(lfs)) == 0) {
+                if (lfs_globals_id(lfs) == lfs_tag_id(besttag)) {
                     besttag |= 0x80000000;
                 } else if (besttag != -1 &&
-                        lfs->globals.id < lfs_tag_id(besttag)) {
+                        lfs_globals_id(lfs) < lfs_tag_id(besttag)) {
                     besttag -= LFS_MKTAG(0, 1, 0);
                 }
             }
@@ -920,17 +939,15 @@ static int lfs_dir_fetch(lfs_t *lfs,
 }
 
 static int lfs_dir_getglobals(lfs_t *lfs, const lfs_mdir_t *dir,
-        struct lfs_globals *globals) {
-    struct lfs_globals locals;
+        union lfs_globals *globals) {
+    union lfs_globals locals;
     lfs_stag_t res = lfs_dir_get(lfs, dir, LFS_MKTAG(0xe00, 0, 0),
-            LFS_MKTAG(LFS_TYPE_GLOBALS, 0, 10), &locals);
+            LFS_MKTAG(LFS_TYPE_GLOBALS, 0, sizeof(locals)), &locals);
     if (res < 0 && res != LFS_ERR_NOENT) {
         return res;
     }
 
     if (res != LFS_ERR_NOENT) {
-        locals.hasmove = (lfs_tag_type3(res) & 2);
-        locals.orphans = (lfs_tag_type3(res) & 1);
         // xor together to find resulting globals
         lfs_global_xor(globals, &locals);
     }
@@ -1174,10 +1191,9 @@ static int lfs_dir_commitattr(lfs_t *lfs, struct lfs_commit *commit,
 }
 
 static int lfs_dir_commitglobals(lfs_t *lfs, struct lfs_commit *commit,
-        struct lfs_globals *globals) {
+        union lfs_globals *globals) {
     return lfs_dir_commitattr(lfs, commit,
-            LFS_MKTAG(LFS_TYPE_GLOBALS + 2*globals->hasmove + globals->orphans,
-                0x1ff, 10), globals);
+            LFS_MKTAG(LFS_TYPE_GLOBALS, 0x1ff, sizeof(*globals)), globals);
 }
 
 static int lfs_dir_commitcrc(lfs_t *lfs, struct lfs_commit *commit) {
@@ -1196,8 +1212,8 @@ static int lfs_dir_commitcrc(lfs_t *lfs, struct lfs_commit *commit) {
 
     // build crc tag
     bool reset = ~lfs_frombe32(tag) >> 31;
-    tag = LFS_MKTAG(LFS_TYPE_CRC + reset,
-            0x1ff, off - (commit->off+sizeof(lfs_tag_t)));
+    tag = LFS_MKTAG(LFS_TYPE_CRC + reset, 0x1ff,
+        off - (commit->off+sizeof(lfs_tag_t)));
 
     // write out crc
     uint32_t footer[2];
@@ -1356,7 +1372,7 @@ static int lfs_dir_compact(lfs_t *lfs,
         lfs_mdir_t *source, uint16_t begin, uint16_t end) {
     // save some state in case block is bad
     const lfs_block_t oldpair[2] = {dir->pair[1], dir->pair[0]};
-    struct lfs_globals globals, locals;
+    union lfs_globals globals, locals;
     bool relocated = false;
     bool exhausted = false;
 
@@ -1585,27 +1601,27 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         const struct lfs_mattr *attrs) {
     // check for globals work
     struct lfs_mattr cancelattr;
-    struct lfs_globals cancels;
+    union lfs_globals cancels;
     lfs_global_zero(&cancels);
-    if (lfs->globals.hasmove &&
-            lfs_pair_cmp(dir->pair, lfs->globals.pair) == 0) {
+    if (lfs_globals_hasmove(lfs) &&
+            lfs_pair_cmp(dir->pair, lfs_globals_pair(lfs)) == 0) {
         // Wait, we have the move? Just cancel this out here
         // We need to, or else the move can become outdated
-        cancelattr.tag = LFS_MKTAG(LFS_TYPE_DELETE+0xff, lfs->globals.id, 0);
+        cancelattr.tag = lfs->globals.move.tag & LFS_MKTAG(0x1fff, 0x1ff, 0);
         cancelattr.next = attrs;
         attrs = &cancelattr;
 
-        cancels.hasmove = lfs->globals.hasmove;
-        cancels.pair[0] = lfs->globals.pair[0];
-        cancels.pair[1] = lfs->globals.pair[1];
-        cancels.id      = lfs->globals.id;
+        // TODO hm
+        cancels.move.tag     = lfs->globals.move.tag & ~LFS_G_HASORPHANS;
+        cancels.move.pair[0] = lfs->globals.move.pair[0];
+        cancels.move.pair[1] = lfs->globals.move.pair[1];
         lfs_global_fromle32(&lfs->locals);
         lfs_global_xor(&lfs->locals, &cancels);
         lfs_global_tole32(&lfs->locals);
     }
 
-    struct lfs_globals globals = lfs->globals;
-    struct lfs_globals locals = lfs->locals;
+    union lfs_globals globals = lfs->globals;
+    union lfs_globals locals = lfs->locals;
 
     // calculate new directory size
     lfs_tag_t deletetag = 0xffffffff;
@@ -2263,7 +2279,7 @@ int lfs_file_opencfg(lfs_t *lfs, lfs_file_t *file,
         if ((file->flags & 3) != LFS_O_WRONLY) {
             lfs_stag_t res = lfs_dir_get(lfs, &file->m,
                     LFS_MKTAG(0xfff, 0x1ff, 0),
-                    LFS_MKTAG(LFS_TYPE_USERATTR | a->type, file->id, a->size),
+                    LFS_MKTAG(LFS_TYPE_USERATTR + a->type, file->id, a->size),
                     a->buffer);
             if (res < 0 && res != LFS_ERR_NOENT) {
                 err = res;
@@ -3037,7 +3053,7 @@ lfs_ssize_t lfs_getattr(lfs_t *lfs, const char *path,
     }
 
     tag = lfs_dir_get(lfs, &cwd, LFS_MKTAG(0xfff, 0x1ff, 0),
-            LFS_MKTAG(LFS_TYPE_USERATTR | type,
+            LFS_MKTAG(LFS_TYPE_USERATTR + type,
                 id, lfs_min(size, lfs->attr_max)),
             buffer);
     if (tag < 0) {
@@ -3069,7 +3085,7 @@ static int lfs_commitattr(lfs_t *lfs, const char *path,
     }
 
     return lfs_dir_commit(lfs, &cwd,
-            LFS_MKATTR(LFS_TYPE_USERATTR | type, id, buffer, size,
+            LFS_MKATTR(LFS_TYPE_USERATTR + type, id, buffer, size,
             NULL));
 }
 
@@ -3368,9 +3384,9 @@ int lfs_mount(lfs_t *lfs, const struct lfs_config *cfg) {
     lfs_global_fromle32(&lfs->locals);
     lfs_global_xor(&lfs->globals, &lfs->locals);
     lfs_global_zero(&lfs->locals);
-    if (lfs->globals.hasmove) {
+    if (lfs_globals_hasmove(lfs)) {
         LFS_DEBUG("Found move %"PRIu32" %"PRIu32" %"PRIu32,
-                lfs->globals.pair[0], lfs->globals.pair[1], lfs->globals.id);
+                lfs_globals_pair(lfs)[0], lfs_globals_pair(lfs)[1], lfs_globals_id(lfs));
     }
 
     // setup free lookahead
@@ -3586,17 +3602,17 @@ static int lfs_fs_relocate(lfs_t *lfs,
 }
 
 static int lfs_fs_demove(lfs_t *lfs) {
-    if (!lfs->globals.hasmove) {
+    if (!lfs_globals_hasmove(lfs)) {
         return 0;
     }
 
     // Fix bad moves
     LFS_DEBUG("Fixing move %"PRIu32" %"PRIu32" %"PRIu32,
-            lfs->globals.pair[0], lfs->globals.pair[1], lfs->globals.id);
+            lfs_globals_pair(lfs)[0], lfs_globals_pair(lfs)[1], lfs_globals_id(lfs));
 
     // fetch and delete the moved entry
     lfs_mdir_t movedir;
-    int err = lfs_dir_fetch(lfs, &movedir, lfs->globals.pair);
+    int err = lfs_dir_fetch(lfs, &movedir, lfs_globals_pair(lfs));
     if (err) {
         return err;
     }
@@ -3611,7 +3627,7 @@ static int lfs_fs_demove(lfs_t *lfs) {
 }
 
 static int lfs_fs_deorphan(lfs_t *lfs) {
-    if (!lfs->globals.orphans) {
+    if (!lfs_globals_getorphans(lfs)) {
         return 0;
     }
 
@@ -3679,7 +3695,7 @@ static int lfs_fs_deorphan(lfs_t *lfs) {
     }
 
     // mark orphans as fixed
-    lfs_global_orphans(lfs, -lfs->globals.orphans);
+    lfs_global_orphans(lfs, -lfs_globals_getorphans(lfs));
     return 0;
 }
 

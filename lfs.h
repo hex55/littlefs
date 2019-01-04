@@ -380,11 +380,14 @@ typedef struct lfs {
     } *mlist;
     uint32_t seed;
 
-    struct lfs_globals {
-        lfs_block_t pair[2];
-        uint16_t id;
-        bool hasmove;
-        uint8_t orphans;
+    union lfs_globals {
+        uint32_t u32[3];
+        uint16_t flags; // TODO make uint8?
+        uint8_t orphans; // TODO get rid of this!
+        struct {
+            uint32_t tag;
+            lfs_block_t pair[2];
+        } move;
     } globals, locals;
 
     struct lfs_free {
