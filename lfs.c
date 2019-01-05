@@ -381,21 +381,21 @@ static inline void lfs_global_tole32(union lfs_globals *a) {
 
 static inline void lfs_global_move(lfs_t *lfs,
         bool hasmove, const lfs_block_t pair[2], uint16_t id) {
-    lfs_global_fromle32(&lfs->locals);
-    lfs_global_xor(&lfs->locals, &lfs->globals);
-    lfs->globals.move.tag &= ~LFS_MKTAG(0x1fff, 0x1ff, LFS_G_HASMOVE);
-    lfs->globals.move.tag |= hasmove ? LFS_G_HASMOVE : 0;
-    lfs->globals.move.tag |= LFS_MKTAG(LFS_TYPE_DELETE+0xff, id, 0);
-    lfs->globals.move.pair[0] = pair[0];
-    lfs->globals.move.pair[1] = pair[1];
-    lfs_global_xor(&lfs->locals, &lfs->globals);
-    lfs_global_tole32(&lfs->locals);
+    lfs_global_fromle32(&lfs->gdelta);
+    lfs_global_xor(&lfs->gdelta, &lfs->gpending);
+    lfs->gpending.move.tag &= ~LFS_MKTAG(0x1fff, 0x1ff, LFS_G_HASMOVE);
+    lfs->gpending.move.tag |= hasmove ? LFS_G_HASMOVE : 0;
+    lfs->gpending.move.tag |= LFS_MKTAG(LFS_TYPE_DELETE+0xff, id, 0);
+    lfs->gpending.move.pair[0] = pair[0];
+    lfs->gpending.move.pair[1] = pair[1];
+    lfs_global_xor(&lfs->gdelta, &lfs->gpending);
+    lfs_global_tole32(&lfs->gdelta);
 }
 
 static inline void lfs_global_orphans(lfs_t *lfs, int8_t orphans) {
-    lfs->locals.orphans ^= (lfs->globals.orphans == 0);
-    lfs->globals.orphans += orphans;
-    lfs->locals.orphans ^= (lfs->globals.orphans == 0);
+    lfs->gdelta.orphans ^= (lfs->gpending.orphans == 0);
+    lfs->gpending.orphans += orphans;
+    lfs->gdelta.orphans ^= (lfs->gpending.orphans == 0);
 }
 
 static inline bool lfs_globals_hasmove(lfs_t *lfs) {
@@ -447,7 +447,7 @@ static inline void lfs_superblock_tole32(lfs_superblock_t *superblock) {
 
 
 /// Internal operations predeclared here ///
-static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
+static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir, // TODO clean up predeclared functions?
         const struct lfs_mattr *attrs);
 static int lfs_dir_compact(lfs_t *lfs,
         lfs_mdir_t *dir, const struct lfs_mattr *attrs, int attrcount,
@@ -1305,7 +1305,7 @@ static int lfs_dir_drop(lfs_t *lfs, lfs_mdir_t *dir, const lfs_mdir_t *tail) {
     dir->split = tail->split;
 
     // steal state
-    int err = lfs_dir_getglobals(lfs, tail, &lfs->locals);
+    int err = lfs_dir_getglobals(lfs, tail, &lfs->gdelta);
     if (err) {
         return err;
     }
@@ -1372,7 +1372,6 @@ static int lfs_dir_compact(lfs_t *lfs,
         lfs_mdir_t *source, uint16_t begin, uint16_t end) {
     // save some state in case block is bad
     const lfs_block_t oldpair[2] = {dir->pair[1], dir->pair[0]};
-    union lfs_globals globals, locals;
     bool relocated = false;
     bool exhausted = false;
 
@@ -1456,9 +1455,7 @@ static int lfs_dir_compact(lfs_t *lfs,
         if (true) {
             // There's nothing special about our global delta, so feed it into
             // our local global delta
-            globals = lfs->globals;
-            locals = lfs->locals;
-            int err = lfs_dir_getglobals(lfs, dir, &locals);
+            int err = lfs_dir_getglobals(lfs, dir, &lfs->gdelta);
             if (err) {
                 return err;
             }
@@ -1511,18 +1508,16 @@ static int lfs_dir_compact(lfs_t *lfs,
                 return err;
             }
 
-            if (!relocated && !lfs_global_iszero(&locals)) {
+            if (!relocated && !lfs_global_iszero(&lfs->gdelta)) {
                 // commit any globals, unless we're relocating,
                 // in which case our parent will steal our globals
-                err = lfs_dir_commitglobals(lfs, &commit, &locals);
+                err = lfs_dir_commitglobals(lfs, &commit, &lfs->gdelta);
                 if (err) {
                     if (err == LFS_ERR_CORRUPT) {
                         goto relocate;
                     }
                     return err;
                 }
-
-                lfs_global_zero(&locals);
             }
 
             if (!lfs_pair_isnull(dir->tail)) {
@@ -1580,11 +1575,11 @@ relocate:
         continue;
     }
 
-    // successful commit, update globals
-    lfs->globals = globals;
-    lfs->locals = locals;
-
-    if (relocated) {
+    if (!relocated) {
+        // successful commit, update globals
+        lfs->globals = lfs->gpending;
+        lfs_global_zero(&lfs->gdelta);
+    } else {
         // update references if we relocated
         LFS_DEBUG("Relocating %"PRIu32" %"PRIu32" to %"PRIu32" %"PRIu32,
                 oldpair[0], oldpair[1], dir->pair[0], dir->pair[1]);
@@ -1601,27 +1596,26 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         const struct lfs_mattr *attrs) {
     // check for globals work
     struct lfs_mattr cancelattr;
-    union lfs_globals cancels;
-    lfs_global_zero(&cancels);
-    if (lfs_globals_hasmove(lfs) &&
-            lfs_pair_cmp(dir->pair, lfs_globals_pair(lfs)) == 0) {
+    //union lfs_globals cancels;
+    //lfs_global_zero(&cancels);
+    if ((lfs->gpending.flags & LFS_G_HASMOVE) &&
+            lfs_pair_cmp(dir->pair, lfs->gpending.move.pair) == 0) {
         // Wait, we have the move? Just cancel this out here
         // We need to, or else the move can become outdated
-        cancelattr.tag = lfs->globals.move.tag & LFS_MKTAG(0x1fff, 0x1ff, 0);
+        cancelattr.tag = lfs->gpending.move.tag & LFS_MKTAG(0x1fff, 0x1ff, 0);
         cancelattr.next = attrs;
         attrs = &cancelattr;
 
-        // TODO hm
-        cancels.move.tag     = lfs->globals.move.tag & ~LFS_G_HASORPHANS;
-        cancels.move.pair[0] = lfs->globals.move.pair[0];
-        cancels.move.pair[1] = lfs->globals.move.pair[1];
-        lfs_global_fromle32(&lfs->locals);
-        lfs_global_xor(&lfs->locals, &cancels);
-        lfs_global_tole32(&lfs->locals);
+        // TODO clean
+        lfs->gdelta.move.tag ^= cancelattr.tag;
+        lfs->gdelta.move.tag ^= LFS_G_HASMOVE;
+        lfs->gdelta.move.pair[0] ^= lfs->gpending.move.pair[0];
+        lfs->gdelta.move.pair[1] ^= lfs->gpending.move.pair[1];
+        lfs->gpending.move.tag &= ~cancelattr.tag;
+        lfs->gpending.move.tag &= ~LFS_G_HASMOVE;
+        lfs->gpending.move.pair[0] = 0;
+        lfs->gpending.move.pair[1] = 0;
     }
-
-    union lfs_globals globals = lfs->globals;
-    union lfs_globals locals = lfs->locals;
 
     // calculate new directory size
     lfs_tag_t deletetag = 0xffffffff;
@@ -1681,21 +1675,19 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         }
 
         // commit any global diffs if we have any
-        if (!lfs_global_iszero(&locals)) {
-            err = lfs_dir_getglobals(lfs, dir, &locals);
+        if (!lfs_global_iszero(&lfs->gdelta)) {
+            err = lfs_dir_getglobals(lfs, dir, &lfs->gdelta);
             if (err) {
                 return err;
             }
 
-            err = lfs_dir_commitglobals(lfs, &commit, &locals);
+            err = lfs_dir_commitglobals(lfs, &commit, &lfs->gdelta);
             if (err) {
                 if (err == LFS_ERR_NOSPC || err == LFS_ERR_CORRUPT) {
                     goto compact;
                 }
                 return err;
             }
-
-            lfs_global_zero(&locals);
         }
 
         // finalize commit with the crc
@@ -1711,8 +1703,8 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         dir->off = commit.off;
         dir->etag = commit.ptag;
         // successful commit, update globals
-        lfs->globals = globals;
-        lfs->locals = locals;
+        lfs->globals = lfs->gpending;
+        lfs_global_zero(&lfs->gdelta);
     } else {
 compact:
         // fall back to compaction
@@ -1724,9 +1716,6 @@ compact:
             return err;
         }
     }
-
-    // update globals that are affected
-    lfs_global_xor(&lfs->globals, &cancels);
 
     // update any directories that are affected
     lfs_mdir_t copy = *dir;
@@ -1805,6 +1794,7 @@ int lfs_mkdir(lfs_t *lfs, const char *path) {
     }
 
     // setup dir
+    // TODO update tail through commit list?
     dir.tail[0] = pred.tail[0];
     dir.tail[1] = pred.tail[1];
     err = lfs_dir_commit(lfs, &dir, NULL);
@@ -3189,7 +3179,8 @@ static int lfs_init(lfs_t *lfs, const struct lfs_config *cfg) {
     lfs->mlist = NULL;
     lfs->seed = 0;
     lfs_global_zero(&lfs->globals);
-    lfs_global_zero(&lfs->locals);
+    lfs_global_zero(&lfs->gpending);
+    lfs_global_zero(&lfs->gdelta);
 
     return 0;
 
@@ -3368,7 +3359,7 @@ int lfs_mount(lfs_t *lfs, const struct lfs_config *cfg) {
         }
 
         // has globals?
-        err = lfs_dir_getglobals(lfs, &dir, &lfs->locals);
+        err = lfs_dir_getglobals(lfs, &dir, &lfs->gpending);
         if (err) {
             return err;
         }
@@ -3381,9 +3372,8 @@ int lfs_mount(lfs_t *lfs, const struct lfs_config *cfg) {
     }
 
     // update littlefs with globals
-    lfs_global_fromle32(&lfs->locals);
-    lfs_global_xor(&lfs->globals, &lfs->locals);
-    lfs_global_zero(&lfs->locals);
+    lfs_global_fromle32(&lfs->gpending);
+    lfs->globals = lfs->gpending;
     if (lfs_globals_hasmove(lfs)) {
         LFS_DEBUG("Found move %"PRIu32" %"PRIu32" %"PRIu32,
                 lfs_globals_pair(lfs)[0], lfs_globals_pair(lfs)[1], lfs_globals_id(lfs));

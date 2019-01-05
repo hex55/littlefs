@@ -124,6 +124,7 @@ enum lfs_type {
     // internal chip sources
     LFS_FROM_MOVE           = 0x201,
     LFS_FROM_USERATTRS      = 0x202,
+    LFS_FROM_GLOBALS        = 0x203,
 };
 
 // File open flags
@@ -388,7 +389,7 @@ typedef struct lfs {
             uint32_t tag;
             lfs_block_t pair[2];
         } move;
-    } globals, locals;
+    } globals, gpending, gdelta;
 
     struct lfs_free {
         lfs_block_t off;
