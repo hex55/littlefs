@@ -380,14 +380,15 @@ static inline void lfs_global_tole32(union lfs_globals *a) {
 }
 
 static inline void lfs_global_move(lfs_t *lfs,
-        bool hasmove, uint16_t id, const lfs_block_t pair[2]) {
+        uint16_t id, const lfs_block_t pair[2]) {
+    bool hasmove = (id != 0x1ff);
     lfs_global_fromle32(&lfs->gdelta);
     lfs_global_xor(&lfs->gdelta, &lfs->gpending);
     lfs->gpending.move.tag &= ~LFS_MKTAG(0xfff, 0x1ff, 0);
     lfs->gpending.move.tag |= hasmove ?
             LFS_MKTAG(LFS_TYPE_DELETE+0xff, id, 0) : 0;
-    lfs->gpending.move.pair[0] = pair[0];
-    lfs->gpending.move.pair[1] = pair[1];
+    lfs->gpending.move.pair[0] = hasmove ? pair[0] : 0; // TODO???
+    lfs->gpending.move.pair[1] = hasmove ? pair[1] : 0;
     lfs_global_xor(&lfs->gdelta, &lfs->gpending);
     lfs_global_tole32(&lfs->gdelta);
 }
@@ -1396,7 +1397,7 @@ static int lfs_dir_compact(lfs_t *lfs,
         // space is complicated, we need room for tail, crc, globals,
         // cleanup delete, and we cap at half a block to give room
         // for metadata updates
-        if (size <= lfs_min(lfs->cfg->block_size - 38,
+        if (size <= lfs_min(lfs->cfg->block_size - 36,
                 lfs_alignup(lfs->cfg->block_size/2, lfs->cfg->prog_size))) {
             break;
         }
@@ -1411,7 +1412,7 @@ static int lfs_dir_compact(lfs_t *lfs,
             // if we fail to split, we may be able to overcompact, unless
             // we're too big for even the full block, in which case our
             // only option is to error
-            if (err == LFS_ERR_NOSPC && size <= lfs->cfg->block_size - 38) {
+            if (err == LFS_ERR_NOSPC && size <= lfs->cfg->block_size - 36) {
                 break;
             }
             return err;
@@ -1598,15 +1599,6 @@ relocate:
 
 static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         const struct lfs_mattr *attrs) {
-//    for (const struct lfs_mattr *a = attrs; a; a = a->next) {
-//        if (lfs_tag_type3(a->tag) == LFS_TYPE_GLOBALS) {
-//            const union lfs_globals *g = a->buffer;
-//            lfs_global_orphans(lfs, (int8_t)g->move.tag); // TODO use 10 bits?
-//            lfs_global_move(lfs, g->move.tag & LFS_G_HASMOVE,
-//                lfs_tag_id(g->move.tag), g->move.pair);
-//        }
-//    }
-
     // check for globals work
     struct lfs_mattr cancelattr;
     //union lfs_globals cancels;
@@ -1620,7 +1612,7 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         attrs = &cancelattr;
 
         // TODO clean
-        lfs_global_move(lfs, false, 0, (lfs_block_t[2]){0, 0});
+        lfs_global_move(lfs, 0x1ff, NULL);
     }
 
     // calculate new directory size
@@ -2989,7 +2981,8 @@ int lfs_rename(lfs_t *lfs, const char *oldpath, const char *newpath) {
         // is a bit messy
         newoldtagid += 1;
     }
-    lfs_global_move(lfs, true, newoldtagid, oldcwd.pair);
+
+    lfs_global_move(lfs, newoldtagid, oldcwd.pair);
 
     // move over all attributes
     err = lfs_dir_commit(lfs, &newcwd,
@@ -3695,6 +3688,7 @@ static int lfs_fs_deorphan(lfs_t *lfs) {
 
     // mark orphans as fixed
     lfs_global_orphans(lfs, -lfs_globals_getorphans(lfs));
+    lfs->globals = lfs->gpending;
     return 0;
 }
 
