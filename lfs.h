@@ -381,16 +381,10 @@ typedef struct lfs {
     } *mlist;
     uint32_t seed;
 
-    union lfs_globals {
-        uint32_t u32[3];
-        uint8_t orphans; // TODO get rid of this!
-        // TODO note orphans doesn't fit here on be32 machines
-        struct {
-            uint32_t tag;
-            lfs_block_t pair[2];
-        } move;
-    } globals, gpending, gdelta;
-    uint8_t orphans;
+    struct lfs_gstate {
+        uint32_t tag;
+        lfs_block_t pair[2];
+    } gstate, gpending, gdelta;
 
     struct lfs_free {
         lfs_block_t off;
