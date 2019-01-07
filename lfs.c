@@ -621,9 +621,10 @@ static int lfs_dir_traverse(lfs_t *lfs,
         const struct lfs_mattr *attrs, int attrcount,
         lfs_tag_t tmask, lfs_tag_t tbegin, lfs_tag_t tend, lfs_tag_t tdiff,
         int (*cb)(void *data, lfs_tag_t tag, const void *buffer), void *data) {
+    bool hasseenglobalmove = false; // TODO hmm
     // iterate over directory and attrs, we iterate over attrs in reverse order
     // which lets us "append" commits
-    while (off+lfs_tag_dsize(ptag) < dir->off || attrcount > 0) {
+    while (true) {
         lfs_tag_t tag;
         const void *buffer;
         struct lfs_diskoff disk;
@@ -641,7 +642,7 @@ static int lfs_dir_traverse(lfs_t *lfs,
             disk.off = off+sizeof(lfs_tag_t);
             buffer = &disk;
             ptag = tag;
-        } else {
+        } else if (attrcount > 0) {
             const struct lfs_mattr *a = attrs;
             for (int j = 0; j < attrcount-1; j++) {
                 a = a->next;
@@ -650,6 +651,16 @@ static int lfs_dir_traverse(lfs_t *lfs,
             tag = a->tag;
             buffer = a->buffer;
             attrcount -= 1;
+        } else if (!hasseenglobalmove &&
+                (lfs->gpending.move.tag & LFS_G_HASMOVE) &&
+                lfs_pair_cmp(dir->pair, lfs->gpending.move.pair) == 0) {
+            // Wait, we have pending move? Handle this here (we need to
+            // or else we risk letting moves fall out of date)
+            tag = lfs->gpending.move.tag & LFS_MKTAG(0xfff, 0x1ff, 0);
+            buffer = NULL;
+            hasseenglobalmove = true;
+        } else {
+            return 0;
         }
 
         lfs_tag_t mask = LFS_MKTAG(0xfff, 0, 0);
@@ -686,6 +697,10 @@ static int lfs_dir_traverse(lfs_t *lfs,
         if (lfs_tag_type3(tag) == LFS_FROM_MOVE) {
             uint16_t fromid = lfs_tag_size(tag);
             uint16_t toid = lfs_tag_id(tag);
+            // TODO ew, do something different?
+            // maybe we actually create move here? hmm
+            lfs_tag_t gpendingtag = lfs->gpending.move.tag;
+            lfs->gpending.move.tag &= ~LFS_MKTAG(0xfff, 0x1ff, 0);
             int err = lfs_dir_traverse(lfs,
                     buffer, 0, 0xffffffff, NULL, 0,
                     LFS_MKTAG(0xe00, 0x1ff, 0),
@@ -693,6 +708,7 @@ static int lfs_dir_traverse(lfs_t *lfs,
                     LFS_MKTAG(LFS_TYPE_STRUCT+0x400, fromid+1, 0),
                     LFS_MKTAG(0, toid-fromid, 0) + tdiff,
                     cb, data);
+            lfs->gpending.move.tag = gpendingtag;
             if (err) {
                 return err;
             }
@@ -711,8 +727,6 @@ static int lfs_dir_traverse(lfs_t *lfs,
             }
         }
     }
-
-    return 0;
 }
 
 static lfs_stag_t lfs_dir_fetchmatch(lfs_t *lfs,
@@ -1513,6 +1527,21 @@ static int lfs_dir_compact(lfs_t *lfs,
                 return err;
             }
 
+    // successful commit, update globals
+    // TODO BLARHG do this in commit?? need pass flag
+    if ((lfs->gpending.move.tag & LFS_G_HASMOVE) &&
+            lfs_pair_cmp(dir->pair, lfs->gpending.move.pair) == 0) {
+//        // Wait, we have the move? Just cancel this out here
+//        // We need to, or else the move can become outdated
+//        cancelattr.tag = lfs->gpending.move.tag & LFS_MKTAG(0xfff, 0x1ff, 0);
+//        cancelattr.next = attrs;
+//        attrs = &cancelattr;
+//
+//        // TODO clean
+          lfs_global_move(lfs, 0x1ff, NULL);
+            /// TODO need this for globals below, do elsewhere??? where do
+    }
+
             if (!relocated && !lfs_global_iszero(&lfs->gdelta)) {
                 // commit any globals, unless we're relocating,
                 // in which case our parent will steal our globals
@@ -1581,7 +1610,6 @@ relocate:
     }
 
     if (!relocated) {
-        // successful commit, update globals
         lfs->globals = lfs->gpending;
         lfs_global_zero(&lfs->gdelta);
     } else {
@@ -1599,25 +1627,28 @@ relocate:
 
 static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         const struct lfs_mattr *attrs) {
+    // TODO redoc
+    lfs_tag_t deletetag = 0xffffffff;
+    lfs_tag_t createtag = 0xffffffff;
     // check for globals work
     struct lfs_mattr cancelattr;
     //union lfs_globals cancels;
     //lfs_global_zero(&cancels);
     if ((lfs->gpending.move.tag & LFS_G_HASMOVE) &&
             lfs_pair_cmp(dir->pair, lfs->gpending.move.pair) == 0) {
-        // Wait, we have the move? Just cancel this out here
-        // We need to, or else the move can become outdated
-        cancelattr.tag = lfs->gpending.move.tag & LFS_MKTAG(0xfff, 0x1ff, 0);
-        cancelattr.next = attrs;
-        attrs = &cancelattr;
-
-        // TODO clean
-        lfs_global_move(lfs, 0x1ff, NULL);
+//        // Wait, we have the move? Just cancel this out here
+//        // We need to, or else the move can become outdated
+//        cancelattr.tag = lfs->gpending.move.tag & LFS_MKTAG(0xfff, 0x1ff, 0);
+//        cancelattr.next = attrs;
+//        attrs = &cancelattr;
+//
+//        // TODO clean
+//        lfs_global_move(lfs, 0x1ff, NULL);
+        // TODO need mask?
+        deletetag = lfs->gpending.move.tag & LFS_MKTAG(0xfff, 0x1ff, 0);
     }
 
     // calculate new directory size
-    lfs_tag_t deletetag = 0xffffffff;
-    lfs_tag_t createtag = 0xffffffff;
     int attrcount = 0;
     for (const struct lfs_mattr *a = attrs; a; a = a->next) {
         if (lfs_tag_type2(a->tag) == LFS_TYPE_CREATE) {
@@ -1671,6 +1702,20 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
             }
             return err;
         }
+
+    // successful commit, update globals
+    // TODO BLARHG do this in commit?? need pass flag
+    if ((lfs->gpending.move.tag & LFS_G_HASMOVE) &&
+            lfs_pair_cmp(dir->pair, lfs->gpending.move.pair) == 0) {
+//        // Wait, we have the move? Just cancel this out here
+//        // We need to, or else the move can become outdated
+//        cancelattr.tag = lfs->gpending.move.tag & LFS_MKTAG(0xfff, 0x1ff, 0);
+//        cancelattr.next = attrs;
+//        attrs = &cancelattr;
+//
+//        // TODO clean
+          lfs_global_move(lfs, 0x1ff, NULL);
+    }
 
         // commit any global diffs if we have any
         if (!lfs_global_iszero(&lfs->gdelta)) {
