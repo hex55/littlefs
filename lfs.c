@@ -288,10 +288,6 @@ static inline bool lfs_tag_isattr(lfs_tag_t tag) {
     return !(tag & 0x40000000);
 }
 
-static inline bool lfs_tag_issys(lfs_tag_t tag) {
-    return tag & 0x08000000;
-}
-
 static inline bool lfs_tag_isdelete(lfs_tag_t tag) {
     return ((int32_t)(tag << 22) >> 22) == -1;
 }
@@ -312,6 +308,10 @@ static inline uint8_t lfs_tag_chunk(lfs_tag_t tag) {
     return (tag & 0x07f80000) >> 19;
 }
 
+static inline int8_t lfs_tag_splice(lfs_tag_t tag) {
+    return (int8_t)lfs_tag_chunk(tag);
+}
+
 static inline uint16_t lfs_tag_id(lfs_tag_t tag) {
     return (tag & 0x0007fc00) >> 10;
 }
@@ -322,10 +322,6 @@ static inline lfs_size_t lfs_tag_size(lfs_tag_t tag) {
 
 static inline lfs_size_t lfs_tag_dsize(lfs_tag_t tag) {
     return sizeof(tag) + lfs_tag_size(tag + lfs_tag_isdelete(tag));
-}
-
-static inline int8_t lfs_tag_splice(lfs_tag_t tag) {
-    return (int8_t)lfs_tag_chunk(tag);
 }
 
 // operations on attributes in attribute lists
@@ -387,39 +383,6 @@ static inline void lfs_gstate_tole32(struct lfs_gstate *a) {
     lfs_gstate_fromle32(a);
 }
 
-// TODO move these? make not inline?
-static inline void lfs_fs_preporphans(lfs_t *lfs, int8_t orphans) {
-    lfs_gstate_fromle32(&lfs->gdelta);
-    lfs->gdelta.tag ^= lfs_gstate_hasorphans(&lfs->gpending);
-
-    lfs->gpending.tag += orphans;
-
-    lfs->gdelta.tag ^= lfs_gstate_hasorphans(&lfs->gpending);
-    lfs_gstate_tole32(&lfs->gdelta);
-}
-
-static inline void lfs_fs_prepmove(lfs_t *lfs,
-        uint16_t id, const lfs_block_t pair[2]) {
-    lfs_gstate_fromle32(&lfs->gdelta);
-    lfs_gstate_xor(&lfs->gdelta, &lfs->gpending);
-
-    if (id != 0x1ff) {
-        lfs->gpending.tag = LFS_MKTAG(LFS_TYPE_DELETE+0xff, id,
-                lfs_gstate_getorphans(&lfs->gpending));
-        lfs->gpending.pair[0] = pair[0];
-        lfs->gpending.pair[1] = pair[1];
-    } else {
-        lfs->gpending.tag = LFS_MKTAG(0, 0,
-                lfs_gstate_getorphans(&lfs->gpending));
-        lfs->gpending.pair[0] = 0;
-        lfs->gpending.pair[1] = 0;
-    }
-
-    lfs_gstate_xor(&lfs->gdelta, &lfs->gpending);
-    lfs_gstate_tole32(&lfs->gdelta);
-}
-
-
 // other endianness operations
 static void lfs_ctz_fromle32(struct lfs_ctz *ctz) {
     ctz->head = lfs_fromle32(ctz->head);
@@ -453,7 +416,7 @@ static inline void lfs_superblock_tole32(lfs_superblock_t *superblock) {
 
 
 /// Internal operations predeclared here ///
-static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir, // TODO clean up predeclared functions?
+static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
         const struct lfs_mattr *attrs);
 static int lfs_dir_compact(lfs_t *lfs,
         lfs_mdir_t *dir, const struct lfs_mattr *attrs, int attrcount,
@@ -464,6 +427,9 @@ static lfs_stag_t lfs_fs_parent(lfs_t *lfs, const lfs_block_t dir[2],
         lfs_mdir_t *parent);
 static int lfs_fs_relocate(lfs_t *lfs,
         const lfs_block_t oldpair[2], lfs_block_t newpair[2]);
+static void lfs_fs_preporphans(lfs_t *lfs, int8_t orphans);
+static void lfs_fs_prepmove(lfs_t *lfs,
+        uint16_t id, const lfs_block_t pair[2]);
 static int lfs_fs_forceconsistency(lfs_t *lfs);
 static int lfs_deinit(lfs_t *lfs);
 
@@ -949,19 +915,18 @@ static int lfs_dir_fetch(lfs_t *lfs,
     return lfs_dir_fetchmatch(lfs, dir, pair, -1, 0, NULL, NULL, NULL);
 }
 
-// TODO need me?
-static int lfs_dir_getglobals(lfs_t *lfs, const lfs_mdir_t *dir,
+static int lfs_dir_getgstate(lfs_t *lfs, const lfs_mdir_t *dir,
         struct lfs_gstate *gstate) {
-    struct lfs_gstate locals;
+    struct lfs_gstate temp;
     lfs_stag_t res = lfs_dir_get(lfs, dir, LFS_MKTAG(0xe00, 0, 0),
-            LFS_MKTAG(LFS_TYPE_GLOBALS, 0, sizeof(locals)), &locals);
+            LFS_MKTAG(LFS_TYPE_GLOBALS, 0, sizeof(temp)), &temp);
     if (res < 0 && res != LFS_ERR_NOENT) {
         return res;
     }
 
     if (res != LFS_ERR_NOENT) {
         // xor together to find resulting gstate
-        lfs_gstate_xor(gstate, &locals);
+        lfs_gstate_xor(gstate, &temp);
     }
 
     return 0;
@@ -1311,7 +1276,7 @@ static int lfs_dir_drop(lfs_t *lfs, lfs_mdir_t *dir, const lfs_mdir_t *tail) {
     dir->split = tail->split;
 
     // steal state
-    int err = lfs_dir_getglobals(lfs, tail, &lfs->gdelta);
+    int err = lfs_dir_getgstate(lfs, tail, &lfs->gdelta);
     if (err) {
         return err;
     }
@@ -1461,7 +1426,7 @@ static int lfs_dir_compact(lfs_t *lfs,
         if (true) {
             // There's nothing special about our global delta, so feed it into
             // our local global delta
-            int err = lfs_dir_getglobals(lfs, dir, &lfs->gdelta);
+            int err = lfs_dir_getgstate(lfs, dir, &lfs->gdelta);
             if (err) {
                 return err;
             }
@@ -1677,7 +1642,7 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
 
         // commit any global diffs if we have any
         if (!lfs_gstate_iszero(&lfs->gdelta)) {
-            err = lfs_dir_getglobals(lfs, dir, &lfs->gdelta);
+            err = lfs_dir_getgstate(lfs, dir, &lfs->gdelta);
             if (err) {
                 return err;
             }
@@ -3363,7 +3328,7 @@ int lfs_mount(lfs_t *lfs, const struct lfs_config *cfg) {
         }
 
         // has gstate?
-        err = lfs_dir_getglobals(lfs, &dir, &lfs->gpending);
+        err = lfs_dir_getgstate(lfs, &dir, &lfs->gpending);
         if (err) {
             return err;
         }
@@ -3596,6 +3561,38 @@ static int lfs_fs_relocate(lfs_t *lfs,
 
     return 0;
 }
+
+static void lfs_fs_preporphans(lfs_t *lfs, int8_t orphans) {
+    lfs_gstate_fromle32(&lfs->gdelta);
+    lfs->gdelta.tag ^= lfs_gstate_hasorphans(&lfs->gpending);
+
+    lfs->gpending.tag += orphans;
+
+    lfs->gdelta.tag ^= lfs_gstate_hasorphans(&lfs->gpending);
+    lfs_gstate_tole32(&lfs->gdelta);
+}
+
+static void lfs_fs_prepmove(lfs_t *lfs,
+        uint16_t id, const lfs_block_t pair[2]) {
+    lfs_gstate_fromle32(&lfs->gdelta);
+    lfs_gstate_xor(&lfs->gdelta, &lfs->gpending);
+
+    if (id != 0x1ff) {
+        lfs->gpending.tag = LFS_MKTAG(LFS_TYPE_DELETE+0xff, id,
+                lfs_gstate_getorphans(&lfs->gpending));
+        lfs->gpending.pair[0] = pair[0];
+        lfs->gpending.pair[1] = pair[1];
+    } else {
+        lfs->gpending.tag = LFS_MKTAG(0, 0,
+                lfs_gstate_getorphans(&lfs->gpending));
+        lfs->gpending.pair[0] = 0;
+        lfs->gpending.pair[1] = 0;
+    }
+
+    lfs_gstate_xor(&lfs->gdelta, &lfs->gpending);
+    lfs_gstate_tole32(&lfs->gdelta);
+}
+
 
 static int lfs_fs_demove(lfs_t *lfs) {
     if (!lfs_gstate_hasmove(&lfs->gstate)) {
