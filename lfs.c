@@ -835,11 +835,11 @@ static lfs_stag_t lfs_dir_fetchmatch(lfs_t *lfs,
                     tempbesttag += LFS_MKTAG(0, lfs_tag_splice(tag), 0);
                 }
             } else if (lfs_tag_type1(tag) == LFS_TYPE_TAIL) {
-                tempsplit = (lfs_tag_type3(tag) & 1);
+                tempsplit = (lfs_tag_chunk(tag) & 1);
+
                 err = lfs_bd_read(lfs,
                         &lfs->pcache, &lfs->rcache, lfs->cfg->block_size,
-                        dir->pair[0], off+sizeof(tag),
-                        &temptail, sizeof(temptail));
+                        dir->pair[0], off+sizeof(tag), &temptail, 8);
                 if (err) {
                     if (err == LFS_ERR_CORRUPT) {
                         dir->erased = false;
@@ -1269,23 +1269,24 @@ static int lfs_dir_alloc(lfs_t *lfs, lfs_mdir_t *dir) {
     return 0;
 }
 
-static int lfs_dir_drop(lfs_t *lfs, lfs_mdir_t *dir, const lfs_mdir_t *tail) {
-    // steal tail
-    dir->tail[0] = tail->tail[0];
-    dir->tail[1] = tail->tail[1];
-    dir->split = tail->split;
-
+static int lfs_dir_drop(lfs_t *lfs, lfs_mdir_t *dir, lfs_mdir_t *tail) {
     // steal state
     int err = lfs_dir_getgstate(lfs, tail, &lfs->gdelta);
     if (err) {
         return err;
     }
 
-    // update pred's tail
-    return lfs_dir_commit(lfs, dir,
-            LFS_MKATTR(LFS_TYPE_TAIL + dir->split,
-                0x1ff, dir->tail, sizeof(dir->tail),
+    // steal tail
+    lfs_pair_tole32(tail->tail);
+    err = lfs_dir_commit(lfs, dir,
+            LFS_MKATTR(LFS_TYPE_TAIL + tail->split, 0x1ff, tail->tail, 8,
             NULL));
+    lfs_pair_fromle32(tail->tail);
+    if (err) {
+        return err;
+    }
+
+    return 0;
 }
 
 static int lfs_dir_split(lfs_t *lfs,
@@ -1483,8 +1484,8 @@ static int lfs_dir_compact(lfs_t *lfs,
             if (!lfs_pair_isnull(dir->tail)) {
                 lfs_pair_tole32(dir->tail);
                 err = lfs_dir_commitattr(lfs, &commit,
-                        LFS_MKTAG(LFS_TYPE_TAIL + dir->split,
-                            0x1ff, sizeof(dir->tail)), dir->tail);
+                        LFS_MKTAG(LFS_TYPE_TAIL + dir->split, 0x1ff, 8),
+                        dir->tail);
                 lfs_pair_fromle32(dir->tail);
                 if (err) {
                     if (err == LFS_ERR_CORRUPT) {
@@ -1583,9 +1584,14 @@ static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
             deletetag = a->tag;
             LFS_ASSERT(dir->count > 0);
             dir->count -= 1;
+        } else if (lfs_tag_type2(a->tag) == LFS_TYPE_TAIL) {
+            dir->tail[0] = ((lfs_block_t*)a->buffer)[0];
+            dir->tail[1] = ((lfs_block_t*)a->buffer)[1];
+            dir->split = (lfs_tag_chunk(a->tag) & 1);
+            lfs_pair_fromle32(dir->tail);
         }
 
-        attrcount += 1; // TODO do this here?
+        attrcount += 1;
     }
 
     // do we have a pending move?
@@ -1762,28 +1768,24 @@ int lfs_mkdir(lfs_t *lfs, const char *path) {
     }
 
     // setup dir
-    // TODO update tail through commit list?
-    dir.tail[0] = pred.tail[0];
-    dir.tail[1] = pred.tail[1];
-    err = lfs_dir_commit(lfs, &dir, NULL);
+    lfs_pair_tole32(pred.tail);
+    err = lfs_dir_commit(lfs, &dir,
+            LFS_MKATTR(LFS_TYPE_SOFTTAIL, 0x1ff, pred.tail, 8,
+            NULL));
+    lfs_pair_fromle32(pred.tail);
     if (err) {
         return err;
     }
 
     // current block end of list?
-    if (!cwd.split) {
-        // update atomically
-        cwd.tail[0] = dir.pair[0];
-        cwd.tail[1] = dir.pair[1];
-    } else {
+    if (cwd.split) {
         // update tails, this creates a desync
-        pred.tail[0] = dir.pair[0];
-        pred.tail[1] = dir.pair[1];
         lfs_fs_preporphans(lfs, +1);
+        lfs_pair_tole32(dir.pair);
         err = lfs_dir_commit(lfs, &pred,
-                LFS_MKATTR(LFS_TYPE_SOFTTAIL, 0x1ff,
-                    pred.tail, sizeof(pred.tail),
+                LFS_MKATTR(LFS_TYPE_SOFTTAIL, 0x1ff, dir.pair, 8,
                 NULL));
+        lfs_pair_fromle32(dir.pair);
         if (err) {
             return err;
         }
@@ -1797,8 +1799,8 @@ int lfs_mkdir(lfs_t *lfs, const char *path) {
             LFS_MKATTR(LFS_TYPE_DIR, id, path, nlen,
             LFS_MKATTR(LFS_TYPE_CREATE+0x01, id, NULL, 0,
             (!cwd.split)
-                ? LFS_MKATTR(LFS_TYPE_SOFTTAIL, 0x1ff,
-                    cwd.tail, sizeof(cwd.tail), NULL)
+                ? LFS_MKATTR(LFS_TYPE_SOFTTAIL, 0x1ff, dir.pair, 8,
+                  NULL)
                 : NULL))));
     lfs_pair_fromle32(dir.pair);
     if (err) {
@@ -3548,12 +3550,11 @@ static int lfs_fs_relocate(lfs_t *lfs,
     // if we can't find dir, it must be new
     if (err != LFS_ERR_NOENT) {
         // replace bad pair, either we clean up desync, or no desync occured
-        parent.tail[0] = newpair[0];
-        parent.tail[1] = newpair[1];
+        lfs_pair_tole32(newpair);
         err = lfs_dir_commit(lfs, &parent,
-                LFS_MKATTR(LFS_TYPE_TAIL + parent.split,
-                    0x1ff, parent.tail, sizeof(parent.tail),
+                LFS_MKATTR(LFS_TYPE_TAIL + parent.split, 0x1ff, newpair, 8,
                 NULL));
+        lfs_pair_fromle32(newpair);
         if (err) {
             return err;
         }
@@ -3672,12 +3673,11 @@ static int lfs_fs_deorphan(lfs_t *lfs) {
                 LFS_DEBUG("Fixing half-orphan %"PRIu32" %"PRIu32,
                         pair[0], pair[1]);
 
-                pdir.tail[0] = pair[0];
-                pdir.tail[1] = pair[1];
+                lfs_pair_tole32(pair);
                 err = lfs_dir_commit(lfs, &pdir,
-                        LFS_MKATTR(LFS_TYPE_SOFTTAIL,
-                            0x1ff, pdir.tail, sizeof(pdir.tail),
+                        LFS_MKATTR(LFS_TYPE_SOFTTAIL, 0x1ff, pair, 8,
                         NULL));
+                lfs_pair_fromle32(pair);
                 if (err) {
                     return err;
                 }
